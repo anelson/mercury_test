@@ -27,6 +27,10 @@ namespace Mercury
 			_childNodes = new ArrayList();
 		}
 
+		private WordGraphNode(WordGraphNode copyNode) : this(copyNode.NodeId, copyNode.WordId, copyNode.AncestorNode, copyNode.Ordinal, copyNode.Word) {
+			_matchThisWord = copyNode.MatchThisWord;
+		}
+
 		private WordGraphNode(long nodeId, long wordId, WordGraphNode ancestorNode, int ordinal, String word) : this() {
 			_nodeId = nodeId;
 			_wordId = wordId;
@@ -62,6 +66,10 @@ namespace Mercury
 			WordGraphNode child = new WordGraphNode(nodeId, wordId, this, ordinal, word);
 
 			return child;
+		}
+
+		public WordGraphNode Copy() {
+			return new WordGraphNode(this);
 		}
 
 		public void RemoveChild(WordGraphNode child) {

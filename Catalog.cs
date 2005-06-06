@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Reflection;
 using System.Data;
+using System.Threading;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.IO;
@@ -12,7 +13,11 @@ namespace Mercury {
 	public class Catalog : IDisposable {
 		const long NULL_ID = -1;
 
-		SQLiteConnection _conn;
+		SQLiteConnection _conn = null;
+
+		[ThreadStatic]
+		static SQLiteConnection s_conn;
+
 		Hashtable _wordIdHash;
 
 		public Catalog() {
@@ -216,10 +221,17 @@ on ci.catalog_item_id = matching_cat_items.catalog_item_id;";
 
 				//As long as there are letters left associated with this child node's match to the 
 				//search term, continue looking for matching children
-				while (childNode.MatchThisWord.Length > 0) {
+				ArrayList asyncResults = new ArrayList();
+				WordGraphNode workingChildNode = childNode;
+
+				while (workingChildNode.MatchThisWord.Length > 0) {
+					//For each iteration of the loop, work on a different working copy of workingChildNode, so threads
+					//processing other iterations are not effectec by changes to MatchThisWord
+					workingChildNode = workingChildNode.Copy();
+
 					//Look for descendents of this node matching some portion of the search
 					//term.
-					String remainingSearchTerm = searchTerm.Substring(childNode.MatchThisPath.Length);
+					String remainingSearchTerm = searchTerm.Substring(workingChildNode.MatchThisPath.Length);
 
 					using (SQLiteCommand cmd = GetConnection().CreateCommand()) {
 						cmd.CommandType = CommandType.Text;
@@ -246,7 +258,7 @@ where
 						cmd.CreateAndAddUnnamedParameters();
 
 						cmd.Parameters[0].Value = remainingSearchTerm.Substring(0, 1);
-						cmd.Parameters[1].Value = childNode.NodeId;
+						cmd.Parameters[1].Value = workingChildNode.NodeId;
 
 						SQLiteDataReader rdr = cmd.ExecuteReader();
 			
@@ -259,7 +271,7 @@ where
 							int ordinal = rdr.GetInt32(2);
 							String word = rdr.GetString(3);
 
-							WordGraphNode grandChildNode = childNode.AddChild(nodeId, NULL_ID, ordinal, word);
+							WordGraphNode grandworkingChildNode = workingChildNode.AddChild(nodeId, NULL_ID, ordinal, word);
 
 							//Set the MatchThisNode to the longest prefix of the search term that matches this word
 							int prefixLength = remainingSearchTerm.Length;
@@ -272,22 +284,41 @@ where
 								prefixLength--;
 							}
 
-							grandChildNode.MatchThisWord = remainingSearchTerm.Substring(0, prefixLength);
+							grandworkingChildNode.MatchThisWord = remainingSearchTerm.Substring(0, prefixLength);
 						}
 						rdr.Close();
 
 						//Process these child nodes
-						BuildGraphBranch(childNode, searchTerm, completeMatchList);
+						asyncResults.Add(BeginBuildGraphBranch(workingChildNode, searchTerm, completeMatchList));
 					}
 
 					//Remove the right-most character from the match for this node, so children of this node
 					//starting with that character can be explored
-					childNode.MatchThisWord = childNode.MatchThisWord.Substring(0, childNode.MatchThisWord.Length-1);
+					workingChildNode.MatchThisWord = workingChildNode.MatchThisWord.Substring(0, workingChildNode.MatchThisWord.Length-1);
 				}
+
+				//Wait for the processing of the child graphs
+				EndBuildGraphBranch((IAsyncResult[])asyncResults.ToArray(typeof(IAsyncResult)));
 			}
 
 			//All children processed; remove them
 			node.RemoveAllChildren();
+		}
+
+		delegate void BuildGraphBranchDelegate(WordGraphNode node, String searchTerm, ArrayList completeMatchList);
+		BuildGraphBranchDelegate _del;
+
+		private IAsyncResult BeginBuildGraphBranch(WordGraphNode node, String searchTerm, ArrayList completeMatchList) {
+			if (_del == null ) {	
+				_del = new BuildGraphBranchDelegate(BuildGraphBranch);
+			}
+			return _del.BeginInvoke(node, searchTerm, completeMatchList, null, null);
+		}
+
+		private void EndBuildGraphBranch(IAsyncResult[] ars) {
+			foreach (IAsyncResult ar in ars) {
+				_del.EndInvoke(ar);
+			}
 		}
 
 		private WordGraphNode BuildRootGraphNode(String searchTerm) {
@@ -541,6 +572,7 @@ values(?, ?, ?, ?, ?, ?)";
 		}
 
 		private SQLiteConnection GetConnection() {
+			/*
 			if (_conn == null) {
 				String connStr = "Data Source=mercury.db;Compress=False;UTF8Encoding=True;Version=3";
 				if (!File.Exists("mercury.db")) {
@@ -552,6 +584,21 @@ values(?, ?, ?, ?, ?, ?)";
 			}
 
 			return _conn;
+			*/
+			if (Catalog.s_conn== null) {
+				String connStr = "Data Source=mercury.db;Compress=False;UTF8Encoding=True;Version=3";
+				if (!File.Exists("mercury.db")) {
+					connStr += ";New=True";
+				}
+				Catalog.s_conn = new SQLiteConnection (connStr) ;
+				Catalog.s_conn.Open();
+			}
+
+			if (_wordIdHash == null) {
+				_wordIdHash = new Hashtable();
+			}
+
+			return Catalog.s_conn;
 		}
 
 		private String[] TokenizeTitle(String title) {
