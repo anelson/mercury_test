@@ -13,7 +13,7 @@ namespace Mercury {
 	public class Catalog : IDisposable {
 		const long NULL_ID = -1;
 
-		SQLiteConnection _conn = null;
+		//SQLiteConnection _conn = null;
 
 		[ThreadStatic]
 		static SQLiteConnection s_conn;
@@ -26,9 +26,11 @@ namespace Mercury {
 		#region IDisposable Members
 
 		public void Dispose() {
+			/*
 			if (_conn != null) {
 				_conn.Dispose();
 			}
+			*/
 		}
 
 		#endregion
@@ -149,23 +151,40 @@ create temp table matching_node_ids (
 					}
 				}
 
-				//Temp table is built; join it with title_word_graph_node_items and catalog_items
+				//Temp table of matching node ids is populated
+				//Create and populate a temp table to store the catalog item IDs corresponding to these node ids
 				using (SQLiteCommand cmd = conn.CreateCommand()) {
 					cmd.Transaction = tx;
 					cmd.CommandType = CommandType.Text;
 					cmd.CommandText = @"
-select ci.catalog_item_id, ci.title, ci.uri
-from catalog_items ci inner join 
-(
+create temp table matching_cat_ids (
+	catalog_item_id integer primary key
+);";
+					cmd.ExecuteNonQuery();
+				}
+				using (SQLiteCommand cmd = conn.CreateCommand()) {
+					cmd.Transaction = tx;
+					cmd.CommandType = CommandType.Text;
+					cmd.CommandText = @"
+insert into matching_cat_ids
 	select distinct ni.catalog_item_id as catalog_item_id
 	from
 	matching_node_ids mn
 	inner join
 	title_word_graph_node_items ni
 	on
-	mn.node_id = ni.node_id
-) as matching_cat_items
-on ci.catalog_item_id = matching_cat_items.catalog_item_id;";
+	mn.node_id = ni.node_id";
+					cmd.ExecuteNonQuery();
+				}
+
+				//Temp table of catalog_item_ids is populated.  Join with the catalog item table
+				using (SQLiteCommand cmd = conn.CreateCommand()) {
+					cmd.Transaction = tx;
+					cmd.CommandType = CommandType.Text;
+					cmd.CommandText = @"
+select ci.catalog_item_id, ci.title, ci.uri
+from catalog_items ci inner join matching_cat_ids
+on ci.catalog_item_id = matching_cat_ids.catalog_item_id;";
 					SQLiteDataReader rdr = cmd.ExecuteReader();
 			
 					while (rdr.Read()) {
@@ -178,7 +197,12 @@ on ci.catalog_item_id = matching_cat_items.catalog_item_id;";
 					rdr.Close();
 				}
 
-				//Results are retrieved.  Drop the temp table and return
+				//Results are retrieved.  Drop the temp tables and return
+				using (SQLiteCommand cmd = conn.CreateCommand()) {
+					cmd.CommandType = CommandType.Text;
+					cmd.CommandText = @"drop table matching_cat_ids;";
+					cmd.ExecuteNonQuery();
+				}
 				using (SQLiteCommand cmd = conn.CreateCommand()) {
 					cmd.CommandType = CommandType.Text;
 					cmd.CommandText = @"drop table matching_node_ids;";
@@ -194,6 +218,7 @@ on ci.catalog_item_id = matching_cat_items.catalog_item_id;";
 		void BuildGraphBranch(WordGraphNode node, String searchTerm, ArrayList completeMatchList) {
 			//Populates the children of a given node with title word graph nodes matching the search term
 			//node is assumed to have at least one generation of children.
+			ArrayList asyncResults = new ArrayList();
 			foreach (WordGraphNode childNode in node.ChildNodes) {
 				//Each child node is assumed to have been matched with the longest prefix it has in common
 				//with the search term.  Thus, further descendants will be matched against what remains
@@ -221,14 +246,9 @@ on ci.catalog_item_id = matching_cat_items.catalog_item_id;";
 
 				//As long as there are letters left associated with this child node's match to the 
 				//search term, continue looking for matching children
-				ArrayList asyncResults = new ArrayList();
 				WordGraphNode workingChildNode = childNode;
 
 				while (workingChildNode.MatchThisWord.Length > 0) {
-					//For each iteration of the loop, work on a different working copy of workingChildNode, so threads
-					//processing other iterations are not effectec by changes to MatchThisWord
-					workingChildNode = workingChildNode.Copy();
-
 					//Look for descendents of this node matching some portion of the search
 					//term.
 					String remainingSearchTerm = searchTerm.Substring(workingChildNode.MatchThisPath.Length);
@@ -292,14 +312,18 @@ where
 						asyncResults.Add(BeginBuildGraphBranch(workingChildNode, searchTerm, completeMatchList));
 					}
 
+					//For each iteration of the loop, work on a different working copy of workingChildNode, so threads
+					//processing other iterations are not effectec by changes to MatchThisWord
+					workingChildNode = workingChildNode.Copy();
+
 					//Remove the right-most character from the match for this node, so children of this node
 					//starting with that character can be explored
 					workingChildNode.MatchThisWord = workingChildNode.MatchThisWord.Substring(0, workingChildNode.MatchThisWord.Length-1);
 				}
-
-				//Wait for the processing of the child graphs
-				EndBuildGraphBranch((IAsyncResult[])asyncResults.ToArray(typeof(IAsyncResult)));
 			}
+
+			//Wait for the processing of the child graphs
+			EndBuildGraphBranch((IAsyncResult[])asyncResults.ToArray(typeof(IAsyncResult)));
 
 			//All children processed; remove them
 			node.RemoveAllChildren();

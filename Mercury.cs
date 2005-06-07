@@ -160,8 +160,7 @@ namespace Mercury
 			_started = DateTime.Now;
 			_itemsAdded = 0;
 
-			//LoadFolder(@"S:\Mainline\acs_non_dev");
-			LoadFolder(@"S:\Mainline\acs_non_dev\sln_Design_v1.0\ACS.UI\Panels");
+			LoadFolder(@"S:\Mainline\acs_non_dev");
 
 			_cat.EndBuildCatalog(obj);
 
@@ -193,12 +192,8 @@ namespace Mercury
 
 			SearchResults srs = _cat.SearchCatalog(searchTerm);
 
-			//Copy to an ArrayList and sort
-			ArrayList al = new ArrayList(srs);
-			al.Sort();
-
 			lstResults.Items.Clear();
-			foreach (SearchResult sr in al) {
+			foreach (SearchResult sr in srs) {
 				lstResults.Items.Add(sr);
 			}
 		}
