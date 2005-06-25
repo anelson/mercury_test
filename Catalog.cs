@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Diagnostics;
 using System.Reflection;
 using System.Data;
 using System.Threading;
@@ -19,6 +20,7 @@ namespace Mercury {
 		static SQLiteConnection s_conn;
 
 		Hashtable _wordIdHash;
+		Hashtable _tempTableHash;
 
 		public Catalog() {
 		}
@@ -98,7 +100,7 @@ namespace Mercury {
 
 		public SearchResults SearchCatalog(String searchTerm) {
 			SearchResults results = new SearchResults();
-
+			
 			//This entire search is case-insensitive
 			searchTerm = searchTerm.Trim().ToLower();
 
@@ -107,23 +109,109 @@ namespace Mercury {
 				return results;
 			}
 
-			//In order to perform the search, explore the
-			//title word graph, searching out those nodes which can
-			//fully account for the search abbreviation.
+			//The search term is applied to the graph of nodes
+			//once for each permutation of the search term, where
+			//a permutation consists of the original search term with
+			//zero or more word separators inserted between the letters.
+			//This, for the search term 'cpal', one permutation would match
+			//a single word prefixed with 'cpal', while another permutation 
+			//might a word prefixed with 'c', followed one or more words later 
+			//by a word prefixed with 'pal'.
+			//
+			//This is conveniently expressed by a bitmap where each bit
+			//represents the space between two adjacent letters in the search term
+			//A 1 bit indicates the presence of a word separator between the letters,
+			//while a 0 bit denotes no word separator.
+			//
+			//Thus, computing the permutations is as simple as counting from
+			//0 to 2^n - 1, where n is the number of spaces between characters
+			//in the search term.  This is simply the length of the search term minus
+			//1.
+			int bitmapLen = searchTerm.Length - 1;
+			System.Diagnostics.Trace.Assert(searchTerm.Length < 64);
+
+			//Keep an array list of the separated search terms, 
+			//where each element in the array list is an array of strings, 
+			//with each string being the prefix of a word in the word graph
+			ArrayList searchTermPermutations = new ArrayList();
+			ArrayList searchTermBitmaps = new ArrayList();
+			
+			if (searchTerm.Length != 1) 
+			{
+				for (ulong bitmap = 0; bitmap < (1UL << bitmapLen); bitmap++) 
+				{
+					//Count the 1 bits in this value of bitmap */
+					ulong w = bitmap;
+					int numOnes = 0;
+					while (w != 0) 
+					{
+						numOnes++;
+						w &= w - 1;
+					}
+
+					//There are numOnes word separators to be inserted, therefore
+					//there will be numOnes + 1 substrings as a result
+					String[] searchString = new String[numOnes + 1];
+					int[] separatorIdxs = new int[numOnes];
+					int lastIdx = 0;
+
+					//For each non-zero bit in the bitmap, split the string there
+					for (ulong mask = 1, idx = 0; 
+						mask <= bitmap; 
+						idx++, mask<<=1) 
+					{
+						if ((bitmap & mask) == mask) 
+						{
+							//The idx-th bit is set, so split the search term
+							//after the idx+1st character
+							separatorIdxs[lastIdx++] = (int)idx + 1;						
+						}
+					}
+
+					//separatorIdxs is a list of the 0-based character positions after
+					//which a separator should be inserted.  Thus, 1 denotes separating 
+					//the first char from the rest, 2 separates the first two chars, etc
+					lastIdx = 0;
+					for (int idx = 0; idx < separatorIdxs.Length; idx++) 
+					{
+						searchString[idx] = searchTerm.Substring(lastIdx,  separatorIdxs[idx] - lastIdx);
+						lastIdx = separatorIdxs[idx];
+					}
+					//The last substring is from the last index plus one, to the end
+					//of the search string
+					searchString[searchString.Length - 1] = searchTerm.Substring(lastIdx);
+
+					searchTermPermutations.Add(searchString);
+					searchTermBitmaps.Add(bitmap);
+				}
+			} 
+			else 
+			{
+				//Search term is only one char long
+				searchTermPermutations.Add(new String[] {searchTerm} );
+				searchTermBitmaps.Add(0UL);
+			
+			}
 
 			SQLiteConnection conn = GetConnection();
+			//If the temp table hash exists from the last search, drop
+			//all the temp tables listed therein
+			if (_tempTableHash != null) {
+				using (SQLiteCommand cmd = conn.CreateCommand()) {
+					cmd.CommandType = CommandType.Text;
+					
+					foreach (String tbl in _tempTableHash.Keys) {
+					cmd.CommandText = "drop table " + tbl;
+						cmd.ExecuteNonQuery();
+
+						Catalog.DumpCommand(cmd);
+					}
+				}
+			}
+			_tempTableHash = new Hashtable();
+			
+            //For each of the permutations, check for matching nodes
 			using (SQLiteTransaction tx = conn.BeginTransaction()) {
-				//Build the root of the word graph, consisting of all nodes
-				//that match the first letter (and possibly additional letters)
-				//of the search term
-				WordGraphNode root = BuildRootGraphNode(searchTerm);
-
-				//Recurse down the nodes in the tree, evaluating more and more
-				//of the search term until it is fully accounted for
-				ArrayList completeMatchList = new ArrayList();
-
-				BuildGraphBranch(root, searchTerm, completeMatchList);
-
 				//Retrieve all catalog items whose title includes the matching nodes
 				//Do this by filling a temp table with the matching node IDs, then
 				//doing a join with some other tables mapping the node IDs to catalog
@@ -135,20 +223,15 @@ namespace Mercury {
 create temp table matching_node_ids (
 	node_id integer primary key
 );";
+					
 					cmd.ExecuteNonQuery();
+
+					Catalog.DumpCommand(cmd);
 				}
 
-				using (SQLiteCommand cmd = conn.CreateCommand()) {
-					cmd.Transaction = tx;
-					cmd.CommandType = CommandType.Text;
-					cmd.CommandText = "insert into matching_node_ids(node_id) values (?)";
-					cmd.CreateAndAddUnnamedParameters();
-					cmd.Prepare();
-
-					foreach (long nodeId in completeMatchList) {
-						cmd.Parameters[0].Value = nodeId;
-						cmd.ExecuteNonQuery();
-					}
+				for (int idx = 0; idx < searchTermPermutations.Count; idx++) {
+					SearchForPermutation((String[])searchTermPermutations[idx],
+										 (ulong)searchTermBitmaps[idx]);
 				}
 
 				//Temp table of matching node ids is populated
@@ -161,6 +244,8 @@ create temp table matching_cat_ids (
 	catalog_item_id integer primary key
 );";
 					cmd.ExecuteNonQuery();
+
+					Catalog.DumpCommand(cmd);
 				}
 				using (SQLiteCommand cmd = conn.CreateCommand()) {
 					cmd.Transaction = tx;
@@ -175,6 +260,8 @@ insert into matching_cat_ids
 	on
 	mn.node_id = ni.node_id";
 					cmd.ExecuteNonQuery();
+
+					Catalog.DumpCommand(cmd);
 				}
 
 				//Temp table of catalog_item_ids is populated.  Join with the catalog item table
@@ -186,6 +273,8 @@ select ci.catalog_item_id, ci.title, ci.uri
 from catalog_items ci inner join matching_cat_ids
 on ci.catalog_item_id = matching_cat_ids.catalog_item_id;";
 					SQLiteDataReader rdr = cmd.ExecuteReader();
+
+					Catalog.DumpCommand(cmd);
 			
 					while (rdr.Read()) {
 						long catId = rdr.GetInt64(0);
@@ -202,11 +291,15 @@ on ci.catalog_item_id = matching_cat_ids.catalog_item_id;";
 					cmd.CommandType = CommandType.Text;
 					cmd.CommandText = @"drop table matching_cat_ids;";
 					cmd.ExecuteNonQuery();
+
+					Catalog.DumpCommand(cmd);
 				}
 				using (SQLiteCommand cmd = conn.CreateCommand()) {
 					cmd.CommandType = CommandType.Text;
 					cmd.CommandText = @"drop table matching_node_ids;";
 					cmd.ExecuteNonQuery();
+
+					Catalog.DumpCommand(cmd);
 				}
 
 				tx.Commit();
@@ -215,190 +308,169 @@ on ci.catalog_item_id = matching_cat_ids.catalog_item_id;";
 			}
 		}
 
-		void BuildGraphBranch(WordGraphNode node, String searchTerm, ArrayList completeMatchList) {
-			//Populates the children of a given node with title word graph nodes matching the search term
-			//node is assumed to have at least one generation of children.
-			ArrayList asyncResults = new ArrayList();
-			foreach (WordGraphNode childNode in node.ChildNodes) {
-				//Each child node is assumed to have been matched with the longest prefix it has in common
-				//with the search term.  Thus, further descendants will be matched against what remains
-				//of the search term after this prefix is removed, and so on recursively until
-				//the entire search term is accounted for.
-				//
-				//Thus, find the child nodes for childNode starting with the maximal-length prefix
-				//accounted for by childNode, then with the max-length prefix minus one, and so on
-				//back to one character prefix.
-				if (childNode.MatchThisPath == searchTerm) {
-					if (!completeMatchList.Contains(childNode.NodeId)) {
-						completeMatchList.Add(childNode.NodeId);
-					}
-					
-					//This is a complete match.  There is little point in looking for child
-					//nodes using this child node, since there are no more chars in the search
-					//term left.  Knock off a character, or if there are no more characters
-					//to knock off, do not perform any further processing on this node
-					if (childNode.MatchThisWord.Length > 1) {
-						childNode.MatchThisWord = childNode.MatchThisWord.Substring(0, childNode.MatchThisWord.Length-1);
-					} else {
-						continue;
-					}
-				}
+        /// <summary>Finds all catalog items whose name matches the specified search terms.  That is,
+        ///     the catalog items contain words matching the prefixes in the searchTerms array,
+        ///     in the same order as the prefixes in the array, although not necessarily contiguous.
+        /// 
+        ///     For each matching catalog item, inserts a row into the temp table matching_node_ids, 
+        ///     which is assumed to be previously created for that purpose.</summary>
+        /// 
+        /// <param name="searchTerms"></param>
+		void SearchForPermutation(String[] searchTerms, ulong bitmap) {
+			SQLiteConnection conn = GetConnection();
 
-				//As long as there are letters left associated with this child node's match to the 
-				//search term, continue looking for matching children
-				WordGraphNode workingChildNode = childNode;
+			//Create and populate the table with the matches for these
+			//terms.  This method will recursively build tables for all
+			//steps up to the last search term in the array.
+			//Thus, the table name returned by this method contains all
+			//matches for this particular combination
+			String tableName = PopulateSearchTable(searchTerms);
 
-				while (workingChildNode.MatchThisWord.Length > 0) {
-					//Look for descendents of this node matching some portion of the search
-					//term.
-					String remainingSearchTerm = searchTerm.Substring(workingChildNode.MatchThisPath.Length);
+			using (SQLiteCommand cmd = conn.CreateCommand()) {
+				cmd.CommandType = CommandType.Text;
+				cmd.CommandText = @"
+insert into matching_node_ids
+select distinct a.node_id from " + tableName + @" a
+left join matching_node_ids mni
+on a.node_id = mni.node_id
+where mni.node_id is null";
+				cmd.ExecuteNonQuery();
 
-					using (SQLiteCommand cmd = GetConnection().CreateCommand()) {
-						cmd.CommandType = CommandType.Text;
-						cmd.CommandText = @"
-select distinct twg.node_id, twg.prev_node_id, twg.ordinal, tw.word
+				Catalog.DumpCommand(cmd);
+			}
+		}
+
+		String PopulateSearchTable(String[] searchTerms) {
+			String tableName = null;
+			StringBuilder sb = new StringBuilder();
+			SQLiteConnection conn = GetConnection();
+
+			//The name of the table containing the results of this search
+			//is the concatenation of the lenghts of each of the search terms, 
+			//which uniquely identifies this particular permutation
+			tableName = "tmp_search_tbl";
+			foreach (String term in searchTerms) {
+				tableName += "_" + term.Length.ToString();
+			}
+
+			//If the named temp table hasn't been created yet, create and populate it
+			//Todo: if this population is to happen in multiple threads, need to 
+			//create a hash table for each connection, as temp tables are only
+			//visible to a single connection, and thus thread
+			if (_tempTableHash.Contains(tableName)) {
+				return tableName;
+			}
+			
+			//Create the table
+			using (SQLiteCommand cmd = conn.CreateCommand()) {
+				cmd.CommandType = CommandType.Text;
+				cmd.CommandText = @"
+create temp table " + tableName + @" (
+node_id integer primary key
+);";
+				cmd.ExecuteNonQuery();
+
+				Catalog.DumpCommand(cmd);
+			}
+
+			//Prepare the insert statement to populate this table 
+			//of results
+			sb.AppendFormat("insert into {0} (node_id) ",
+							tableName);
+			
+			if (searchTerms.Length > 1) {
+				//Ensure that the temp tables containing provisional results upon
+				//which this bitmap depends are extant and populated
+				ArrayList preceedingTerms = new ArrayList(searchTerms);
+				preceedingTerms.RemoveAt(preceedingTerms.Count - 1);
+				
+				String prevTable = PopulateSearchTable((String[])preceedingTerms.ToArray(typeof(String)));
+
+				//Find all nodes descended from the nodes in prevTable, 
+				//with words starting with the last search term in the array
+				sb.AppendFormat(@"
+select distinct twg.node_id
+from 
+	title_word_graph_node_descendants desc
+	inner join
+	{0} src
+	on src.node_id = desc.node_id
+
+	inner join
+	title_word_graph twg
+	on twg.node_id = desc.descendant_node_id
+	
+	inner join 
+	title_words tw
+	on 
+	twg.word_id = tw.word_id
+",
+								prevTable);
+			} else {
+				//Else, this is the first search term of the search, so scour all catalog words
+				//for a match				
+				sb.Append(@"
+select distinct twg.node_id
 from 
 	title_word_graph twg
 	inner join 
 	title_words tw
 	on 
 	twg.word_id = tw.word_id
-
-	inner join
-	title_word_graph_node_descendants desc
-	on
-	twg.node_id = desc.descendant_node_id
-where
-	(
-		tw.one_chars = ?
-		and
-		desc.node_id = ?
-	)";
-
-						cmd.CreateAndAddUnnamedParameters();
-
-						cmd.Parameters[0].Value = remainingSearchTerm.Substring(0, 1);
-						cmd.Parameters[1].Value = workingChildNode.NodeId;
-
-						SQLiteDataReader rdr = cmd.ExecuteReader();
-			
-						while (rdr.Read()) {
-							long nodeId = rdr.GetInt64(0);
-							long prevNodeId = NULL_ID;
-							if (!rdr.IsDBNull(1)) {
-								prevNodeId = rdr.GetInt64(1);
-							}
-							int ordinal = rdr.GetInt32(2);
-							String word = rdr.GetString(3);
-
-							WordGraphNode grandworkingChildNode = workingChildNode.AddChild(nodeId, NULL_ID, ordinal, word);
-
-							//Set the MatchThisNode to the longest prefix of the search term that matches this word
-							int prefixLength = remainingSearchTerm.Length;
-							while (true) {
-								if (word.StartsWith(remainingSearchTerm.Substring(0, prefixLength))) {
-									break;
-								}
-
-								//Else, doesn't start with that much of the search term; back it off
-								prefixLength--;
-							}
-
-							grandworkingChildNode.MatchThisWord = remainingSearchTerm.Substring(0, prefixLength);
-						}
-						rdr.Close();
-
-						//Process these child nodes
-						asyncResults.Add(BeginBuildGraphBranch(workingChildNode, searchTerm, completeMatchList));
-					}
-
-					//For each iteration of the loop, work on a different working copy of workingChildNode, so threads
-					//processing other iterations are not effectec by changes to MatchThisWord
-					workingChildNode = workingChildNode.Copy();
-
-					//Remove the right-most character from the match for this node, so children of this node
-					//starting with that character can be explored
-					workingChildNode.MatchThisWord = workingChildNode.MatchThisWord.Substring(0, workingChildNode.MatchThisWord.Length-1);
-				}
+");
 			}
 
-			//Wait for the processing of the child graphs
-			EndBuildGraphBranch((IAsyncResult[])asyncResults.ToArray(typeof(IAsyncResult)));
-
-			//All children processed; remove them
-			node.RemoveAllChildren();
-		}
-
-		delegate void BuildGraphBranchDelegate(WordGraphNode node, String searchTerm, ArrayList completeMatchList);
-		BuildGraphBranchDelegate _del;
-
-		private IAsyncResult BeginBuildGraphBranch(WordGraphNode node, String searchTerm, ArrayList completeMatchList) {
-			if (_del == null ) {	
-				_del = new BuildGraphBranchDelegate(BuildGraphBranch);
-			}
-			return _del.BeginInvoke(node, searchTerm, completeMatchList, null, null);
-		}
-
-		private void EndBuildGraphBranch(IAsyncResult[] ars) {
-			foreach (IAsyncResult ar in ars) {
-				_del.EndInvoke(ar);
-			}
-		}
-
-		private WordGraphNode BuildRootGraphNode(String searchTerm) {
-			//Returns the root graph node with the first generation of child nodes populated
-			//with all nodes matching the first letter of the search term
-			WordGraphNode root = WordGraphNode.CreateRoot();
+			//Either way, build the WHERE clause to match the text of the
+			//search term.
+			//The database pre-computes the substrings consisting of the first
+			//one through five chars of each title word, making for more efficient
+			//retrieval.  Use the appropriate column, and for words longer
+			//than 5 chars, add an additional predicate to match the entire search term
+			String lastSearchTerm = searchTerms[searchTerms.Length-1];
+			sb.Append(" WHERE ");
+			if (lastSearchTerm.Length == 1) {
+				sb.Append("tw.one_chars = ?");
+			} else if (lastSearchTerm.Length == 2) {
+				sb.Append("tw.two_chars = ?");
+			} else if (lastSearchTerm.Length == 3) {
+				sb.Append("tw.three_chars = ?");
+			} else if (lastSearchTerm.Length == 4) {
+				sb.Append("tw.four_chars = ?");
+			} else if (lastSearchTerm.Length == 5) {
+				sb.Append("tw.five_chars = ?");
+			} else {
+				sb.Append("tw.five_chars = ? and tw.word LIKE ?");
+			} 
 
 			using (SQLiteCommand cmd = GetConnection().CreateCommand()) {
 				cmd.CommandType = CommandType.Text;
-				cmd.CommandText = @"
-select twg.node_id, twg.prev_node_id, twg.ordinal, tw.word
-from 
-	title_word_graph twg
-	inner join 
-	title_words tw
-	on 
-	twg.word_id = tw.word_id
-where
-	tw.one_chars = ?";
+				cmd.CommandText = sb.ToString();
 
 				cmd.CreateAndAddUnnamedParameters();
 
-				cmd.Parameters[0].Value = searchTerm.Substring(0, 1);
-
-				SQLiteDataReader rdr = cmd.ExecuteReader();
-			
-				while (rdr.Read()) {
-					long nodeId = rdr.GetInt64(0);
-					long prevNodeId = NULL_ID;
-					if (!rdr.IsDBNull(1)) {
-						prevNodeId = rdr.GetInt64(1);
-					}
-					int ordinal = rdr.GetInt32(2);
-					String word = rdr.GetString(3);
-
-					WordGraphNode node = root.AddChild(nodeId, NULL_ID, ordinal, word);
-
-					//Set the MatchThisNode to the longest prefix of the search term that matches this word
-					int prefixLength = searchTerm.Length;
-					while (true) {
-						if (word.StartsWith(searchTerm.Substring(0, prefixLength))) {
-							break;
-						}
-
-						//Else, doesn't start with that much of the search term; back it off
-						prefixLength--;
-					}
-
-					node.MatchThisWord = searchTerm.Substring(0, prefixLength);
+				if (lastSearchTerm.Length <= 5) {
+					//Search term fits w/ one of the prefixes
+					cmd.Parameters[0].Value = lastSearchTerm;
+				} else {
+					//search term too big to fit one of the prefixes.
+					//Search on both the first five chars of the term, then 
+					//the entire term
+					cmd.Parameters[0].Value = lastSearchTerm.Substring(0,  5);
+					cmd.Parameters[1].Value = lastSearchTerm + "%";
 				}
-				rdr.Close();
-			}
 
-			return root;
+				//Run the command to populate the table
+				cmd.ExecuteNonQuery();
+
+				Catalog.DumpCommand(cmd);
+			}			
+
+			//Update the hashtable to reflect that this table is populated
+			_tempTableHash.Add(tableName,  true);
+			
+			return tableName;
 		}
-
+		
 		private void SetItemTitleWords(SQLiteTransaction tx, long catId, String title) {
 			//Tokenize the title into lower-case 'words' based on the word breaking algorithm
 			//below, and store each word in the database along with its ordinal position in the
@@ -696,7 +768,41 @@ values(?, ?, ?, ?, ?, ?)";
 		private String WordBreakMatchEvaluator(Match match) {
 			//Called when doing Regex.Replace operations in TokenizeTitle to insert word breaks
 			//into the string
-			return "|" + match.Value;
+
+			//If the first letter of the match is upper case, break before the first
+			//letter.  If the first letter of the match is lower case, break after
+			//the first letter
+			if (Regex.IsMatch(match.Value, @"^\p{Ll}")) {
+				//This is a lower-to-upper transition, so insert the break after the
+				//lower case char
+				//TODO: Is this assumption that the lower-case char is one
+				//char long valid for all unicode glyphs?
+				return match.Value.Substring(0, 1) + "|" + match.Value.Substring(1);
+			} else {
+				return "|" + match.Value;
+			}
+		}
+
+		private static void DumpCommand(SQLiteCommand cmd) {
+			#if DEBUG
+			StringBuilder sb = new StringBuilder();
+
+			sb.Append(cmd.CommandText);
+			sb.Append(Environment.NewLine);
+			sb.Append(Environment.NewLine);
+
+			//Expand placeholders
+			int placeholderIdx, paramNum = 0;
+			while ((placeholderIdx = sb.ToString().IndexOf("?")) != -1) {
+				if (cmd.Parameters[paramNum].Value is String) {
+					sb.Replace("?",  "'" + cmd.Parameters[paramNum++].Value.ToString() + "'",  placeholderIdx,  1);
+				} else {
+					sb.Replace("?",  cmd.Parameters[paramNum++].Value.ToString(),  placeholderIdx,  1);
+				}
+			}
+
+			Debug.WriteLine(sb.ToString());
+			#endif
 		}
 	}
 }

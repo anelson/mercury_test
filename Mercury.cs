@@ -160,7 +160,7 @@ namespace Mercury
 			_started = DateTime.Now;
 			_itemsAdded = 0;
 
-			LoadFolder(@"S:\Mainline\acs_non_dev");
+			LoadFolder(@"C:\Sourcecode\Mainline\acs");
 
 			_cat.EndBuildCatalog(obj);
 
@@ -195,7 +195,8 @@ namespace Mercury
 			lstResults.Items.Clear();
 			foreach (SearchResult sr in srs) {
 				lstResults.Items.Add(sr);
-			}
+				//break;
+			}			
 		}
 
 		private void AddCatalogItem(String title, String path) {

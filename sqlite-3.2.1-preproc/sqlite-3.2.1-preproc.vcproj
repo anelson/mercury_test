@@ -133,6 +133,9 @@
 				RelativePath=".\build.c">
 			</File>
 			<File
+				RelativePath=".\callback.c">
+			</File>
+			<File
 				RelativePath=".\date.c">
 			</File>
 			<File
@@ -173,6 +176,9 @@
 			</File>
 			<File
 				RelativePath=".\pragma.c">
+			</File>
+			<File
+				RelativePath=".\prepare.c">
 			</File>
 			<File
 				RelativePath=".\printf.c">
